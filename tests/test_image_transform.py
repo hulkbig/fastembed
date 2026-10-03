@@ -2,7 +2,7 @@ import numpy as np
 import pytest
 from PIL import Image
 
-from fastembed.image.transform.functional import normalize, resize
+from fastembed.image.transform.functional import normalize, resize, resize_longest_edge
 from fastembed.image.transform.operators import Compose
 
 
@@ -48,6 +48,81 @@ def test_resize_int_keeps_shortest_edge_behaviour() -> None:
     # size sets the shortest edge, and the aspect ratio is preserved.
     assert resize(landscape, size=100).size == (200, 100)
     assert resize(portrait, size=100).size == (100, 200)
+
+
+@pytest.mark.parametrize("longest_edge", [16, 2048])
+@pytest.mark.parametrize(
+    ("size", "expected"),
+    [
+        ((2, 1), (1, 0.5)),
+        ((1, 2), (0.5, 1)),
+    ],
+)
+def test_longest_edge_resize_keeps_ordinary_dimensions(
+    longest_edge: int, size: tuple[int, int], expected: tuple[float, float]
+) -> None:
+    image = Image.new("RGB", (size[0] * longest_edge, size[1] * longest_edge))
+    resized = resize_longest_edge(image, longest_edge)
+    assert resized.size == (int(expected[0] * longest_edge), int(expected[1] * longest_edge))
+
+
+@pytest.mark.parametrize("longest_edge", [16, 2048])
+@pytest.mark.parametrize("portrait", [False, True])
+def test_longest_edge_resize_clamps_thin_images_after_even_rounding(
+    longest_edge: int, portrait: bool
+) -> None:
+    for width, expected_height in [(longest_edge, 2), (2 * longest_edge, 1)]:
+        size = (1, width) if portrait else (width, 1)
+        expected = (expected_height, longest_edge) if portrait else (longest_edge, expected_height)
+        resized = resize_longest_edge(Image.new("RGB", size, (32, 64, 128)), longest_edge)
+        assert resized.size == expected
+        assert resized.getpixel((0, 0)) == (32, 64, 128)
+
+
+@pytest.mark.parametrize(("longest_edge", "patch_size"), [(16, 4), (2048, 512)])
+@pytest.mark.parametrize("case", ["ordinary", "thin_boundary", "landscape", "portrait", "mixed"])
+def test_idefics3_compose_handles_thin_images(
+    longest_edge: int, patch_size: int, case: str
+) -> None:
+    # The 2048/512 case uses Qdrant/colmodernvbert's shipped processor configuration:
+    # https://huggingface.co/Qdrant/colmodernvbert/blob/main/preprocessor_config.json
+    processor = Compose.from_config(
+        {
+            "do_convert_rgb": True,
+            "do_image_splitting": True,
+            "do_normalize": True,
+            "do_pad": True,
+            "do_rescale": True,
+            "do_resize": True,
+            "image_mean": [0.5, 0.5, 0.5],
+            "image_processor_type": "Idefics3ImageProcessor",
+            "image_std": [0.5, 0.5, 0.5],
+            "max_image_size": {"longest_edge": patch_size},
+            "processor_class": "ColModernVBertProcessor",
+            "resample": 1,
+            "rescale_factor": 0.00392156862745098,
+            "size": {"longest_edge": longest_edge},
+        }
+    )
+    sizes = {
+        "ordinary": [(32, 16), (16, 32)],
+        "thin_boundary": [(longest_edge, 1), (1, longest_edge)],
+        "landscape": [(2 * longest_edge, 1)],
+        "portrait": [(1, 2 * longest_edge)],
+        "mixed": [(32, 16), (2 * longest_edge, 1), (1, 2 * longest_edge)],
+    }[case]
+    colors = [(32 + i * 16, 64 + i * 8, 128 - i * 16) for i in range(len(sizes))]
+    output = processor([Image.new("RGB", size, color) for size, color in zip(sizes, colors)])
+
+    assert len(output) == len(sizes)
+    for i, (patches, color) in enumerate(zip(output, colors)):
+        expected_count = 9 if case == "ordinary" or (case == "mixed" and i == 0) else 5
+        assert len(patches) == expected_count
+        expected_pixel = (np.array(color, dtype=np.float32) / 255 - 0.5) / 0.5
+        for patch in patches:
+            assert patch.shape == (3, patch_size, patch_size)
+            assert patch.dtype == np.float32
+            np.testing.assert_allclose(patch[:, 0, 0], expected_pixel, atol=1e-7)
 
 
 @pytest.mark.parametrize(

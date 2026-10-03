@@ -186,6 +186,10 @@ def resize_longest_edge(
     if new_width % 2 != 0:
         new_width += 1
 
+    # Match Idefics3's minimum after rounding: a valid thin image can truncate to zero.
+    new_height = max(new_height, 1)
+    new_width = max(new_width, 1)
+
     return image.resize((new_width, new_height), resample)
 
 
